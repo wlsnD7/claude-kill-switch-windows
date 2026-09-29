@@ -1,82 +1,115 @@
-# Windows + Mihomo/Clash TUN：Claude 网络断线保护笔记
+# Windows + Mihomo/Clash TUN：Claude 断线保护安装教程
 
-目标：代理不可用时，让 Claude Desktop 和 Claude Code 的请求失败，减少回落到直连出口的风险。
+按本教程依次完成：下载脚本 → 配置 TUN → 确认网卡和程序 → 安装防火墙规则 → 设置隐藏监听及登录自启 → 验证。
 
-本文整理了按程序路径添加 Windows 防火墙规则、自动发现版本路径、隐藏启动监听器和登录计划任务的方法。**这是一套有条件的应用级 kill switch，不是经过证明的系统级 fail-closed 方案。** 新程序启动后才补规则，仍存在时间窗口；新增网卡、其他联网进程和代理内的 `DIRECT` 也可能绕过本文的保护范围。
+目标是在代理失效时让 Claude Desktop / Claude Code 连接失败，减少回落到直连的风险。**这是有条件的应用级 kill switch；新版本进程启动到规则补建之间仍有时间窗口，不能保证严格、零泄漏的系统级 fail-closed。**
 
-适用环境：Windows、Windows PowerShell 5.1、具有管理员权限的目标用户、Mihomo 内核的 Clash 客户端。独立安装的 Claude Code 需要核对实际路径；WSL、容器和共享 `node.exe` 不自动包含在内。
+仓库不会在下载时自动安装。想自己安装，从[第 0 步](#step-0)开始按顺序操作；想让 Agent 安装，复制下面整段消息。
 
-本仓库不会在下载时安装任何东西。脚本需要读者配置、检查后手动运行。发布前进行了语法和模拟行为检查，未在本机部署防火墙或进行断网实测。
+<a id="agent-install"></a>
+## 直接发给 Agent 的安装消息
 
-## 1. 原理与边界
-
-正常情况下，希望流量沿下面的路径传输：
+将以下整段文字发给**能操作这台 Windows 电脑、有本地文件和终端权限的 Agent**。只有网页聊天能力的 Agent 无法代你安装。
 
 ```text
-Claude.exe → TUN → Mihomo → 已选代理节点 → 目标服务
+请在我当前这台 Windows 电脑上实际安装并配置这个仓库的 Claude 断线保护，不要只给我教程：
+https://github.com/wlsnD7/claude-kill-switch-windows
+
+先读取当前 README 和全部 scripts 文件，核对行为，再按安装及验证步骤执行。目标是保护当前 Windows 用户使用的 Claude Desktop / Claude Code。
+
+我授权你检查本机网络和程序、下载并审阅仓库、备份相关旧配置、在受管理员保护的目录安装脚本、配置本项目的 Windows 防火墙规则，以及创建或更新 Refresh Claude Kill Switch 登录计划任务。需要管理员权限或工具沙箱授权时，使用正常权限申请，不要绕过。
+
+请自行识别实际 TUN、其他可能直连的网卡以及 Claude 的完整联网程序路径。不要照抄 WLAN、Ethernet、Radmin VPN 或版本目录，不要把 TUN 加入阻止列表，不要封锁共享 node.exe。当前识别不覆盖的安装形式请明确处理；无法确定时只问我必要的问题。
+
+检查 Mihomo/Clash 的实际生效配置。备份后，为 Claude 配置不含 DIRECT 或直连兜底的专用代理策略和前置规则，确保订阅刷新后仍保留。沿用我已有且允许使用的代理节点，不能确定选哪个时再问我。不要公开订阅地址、节点凭据、令牌、日志或个人信息。
+
+若已有旧安装，先核对并备份配置、任务和相关规则，再停止已确认身份的旧监听器。不要覆盖未知任务、删除无关规则或结束全部 PowerShell。不要让提升权限的任务执行普通用户可写的脚本。刷新规则时保留旧路径保护。
+
+不要擅自关闭代理、断网、注销或重启，这些操作可能中断我或你的会话。首次识别程序若需要启动未受保护的程序，先说明隔离安排；需要上述中断操作时，告诉我具体动作和影响，等我同意。没有条件安全做断线测试时，完成静态检查并记为未实测，不能宣称绝对防泄漏。
+
+安装后检查 ActiveStore 中每个目标路径/接口的有效阻止规则、计划任务、唯一监听器和日志，并核对正常请求的 Mihomo 代理链。最后汇报安装目录、覆盖路径和接口、任务状态、已验证和未验证项目，以及停用/回滚命令。不要把规则存在或任务返回 0 当作零泄漏证明。
 ```
 
-TUN 消失时，Windows 可能重新选择其他出口。本文给已知 Claude 可执行文件添加出站阻止规则，使它们不能通过已列出的非 TUN 网卡直接联网。Mihomo 自己需要通过物理网卡连接代理，因此这些规则不针对 Mihomo。
+<a id="step-0"></a>
+## 第 0 步：准备环境和管理员终端
 
-这是设计意图。具体流量在 Windows 过滤层中如何匹配，还受 TUN 实现、接口、协议和本机策略影响，必须验证“代理正常可用”和“代理失效不能直连”两个方向，不能只看规则存在。
+开始前确认：
 
-| 故障或变化 | 本文的处理 | 剩余限制 |
-| --- | --- | --- |
-| 代理节点故障，Mihomo 仍运行 | 专用策略组不包含直连出口 | 必须检查嵌套组、前置规则和实际连接记录 |
-| Mihomo 退出或 TUN 消失 | 阻止已知程序通过已列出的其他网卡出站 | 未列出的网卡和未识别程序不受保护 |
-| Claude 更新，完整路径改变 | 监听进程启动，补建新路径规则 | 新进程可能先发出请求，监听器无法消除这个窗口 |
-| 监听器退出 | 旧规则保留，计划任务按设置重试 | 新版本路径不再自动获得保护；重试次数有限 |
-| Mihomo 将请求按 `DIRECT` 转发 | 必须在 Mihomo 配置中避免 | Windows 针对 Claude 的规则不能阻止 Mihomo 自己直连 |
+- 已安装 Claude Desktop 或 Claude Code。本文从零安装的是断线保护，不负责安装 Claude 或提供代理节点。
+- 已安装使用 Mihomo 内核的 Clash 客户端，且现有代理能够正常联网。
+- 当前 Windows 用户有管理员权限。不要改用另一个管理员账户，否则用户路径与任务会对应到另一个人。
+- 已保存工作，准备好在识别程序时暂时断开网络。
 
-如果要求任意应用版本、任何启动时机都不能直连，需要另行设计系统级默认拒绝出口、隔离环境或网关策略，并处理代理自身、DNS、IPv6 和引导连接。本文不提供一条“封所有出站”命令冒充这种设计。
-
-## 2. 先识别程序和网卡
-
-在目标 Windows 用户的**管理员 Windows PowerShell**中查看：
+按 Windows 键，搜索 **Windows PowerShell**，右键选择**以管理员身份运行**。使用 **64 位 Windows PowerShell 5.1**。后续代码块按顺序在这一个窗口执行，不要混用 PowerShell 7 或命令提示符。
 
 ```powershell
-Get-CimInstance Win32_Process -Filter "Name = 'claude.exe'" |
-    Select-Object ProcessId, Name, ExecutablePath
-
-Get-Command claude -ErrorAction SilentlyContinue |
-    Format-List Source, Path, CommandType
-
-Get-AppxPackage | Where-Object { $_.Name -like '*Claude*' } |
-    Select-Object Name, Version, InstallLocation
-
-Get-NetAdapter -IncludeHidden |
-    Format-Table Name, InterfaceDescription, Status, ifIndex
-
-Get-NetIPInterface |
-    Format-Table InterfaceAlias, AddressFamily, InterfaceMetric, ConnectionState
-
-Get-NetRoute -AddressFamily IPv4 |
-    Format-Table DestinationPrefix, InterfaceAlias, NextHop, RouteMetric
-Get-NetRoute -AddressFamily IPv6 |
-    Format-Table DestinationPrefix, InterfaceAlias, NextHop, RouteMetric
+$ErrorActionPreference = 'Stop'
+$PSVersionTable.PSVersion
+[Environment]::Is64BitProcess
+[Security.Principal.WindowsIdentity]::GetCurrent().Name
+$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator
+)
+if (-not $isAdmin) { throw '请重新以管理员身份打开 Windows PowerShell。' }
+Get-Service MpsSvc, BFE | Format-Table Name, Status
+Get-NetFirewallProfile -PolicyStore ActiveStore |
+    Format-Table Name, Enabled, AllowLocalFirewallRules
 ```
 
-不要只检查 `0.0.0.0/0` 和 `::/0`：拆分默认路由和更具体的路由也能成为出口。检查目前断开的网卡以及今后可能启用的以太网、无线、USB 网络共享和其他 VPN。
+**继续条件：**版本为 5.1、64 位结果为 `True`、账户正确，两项服务为 `Running`，相关防火墙配置文件已启用。受组织管理且禁止采用本地规则的设备，需要管理员处理策略。
 
-对话中观察到的路径类型如下，版本号和用户名必须以实际输出为准：
+## 第 1 步：下载仓库并进入正确目录
 
-```text
-Claude Desktop（某些打包安装）
-C:\Program Files\WindowsApps\Claude_<版本>_<架构>__<包标识>\app\Claude.exe
+不需要 Git：
 
-由 Desktop 启动的 Claude Code（本例）
-C:\Users\<用户>\AppData\Roaming\Claude\claude-code\<版本>\claude.exe
+1. 打开[仓库首页](https://github.com/wlsnD7/claude-kill-switch-windows)，点击 **Code → Download ZIP**，或[直接下载 ZIP](https://github.com/wlsnD7/claude-kill-switch-windows/archive/refs/heads/main.zip)。
+2. 在资源管理器中右键 ZIP，选择**全部解压缩**。
+3. 打开解压后的内层文件夹，直到同时看到 `README.md` 和 `scripts`。
+4. 点击资源管理器地址栏，复制该目录完整路径。
+5. 在管理员 PowerShell 执行下面代码，按提示粘贴路径，不要带外层引号。
+
+```powershell
+$repoDir = Read-Host '粘贴同时包含 README.md 和 scripts 的目录路径'
+Set-Location -LiteralPath $repoDir
+$repoDir = (Get-Location).Path
+if (-not (Test-Path -LiteralPath '.\scripts\Update-ClaudeKillSwitch.ps1')) {
+    throw '目录不正确，请进入包含 scripts 的仓库根目录。'
+}
+Get-ChildItem -LiteralPath '.\scripts' | Select-Object Name
 ```
 
-不能把第二种路径当成所有 Claude Code 安装的固定位置。独立 CLI 可能使用其他路径或启动器；若命令指向 `.cmd`、`.ps1`、符号链接或 `node.exe`，应继续确认实际联网进程。直接封锁共享 `node.exe` 会影响其他 Node 应用。
+**预期结果：**看到以下四个文件。先打开阅读，确认内容和来源，再继续。
 
-`Get-Command` 找不到命令不等于程序未安装。进程的 `ExecutablePath` 为空时，检查权限和进程是否已经退出。无法枚举某个目录也不能证明目录是临时的或已经被删除。
+| 文件 | 用途 |
+| --- | --- |
+| [KillSwitch.config.psd1](scripts/KillSwitch.config.psd1) | 阻止的网卡别名和额外程序路径 |
+| [Update-ClaudeKillSwitch.ps1](scripts/Update-ClaudeKillSwitch.ps1) | 发现路径并创建或更新规则 |
+| [Watch-ClaudeKillSwitch.ps1](scripts/Watch-ClaudeKillSwitch.ps1) | 监听 Claude 启动并刷新规则 |
+| [Run-ClaudeKillSwitch-Hidden.vbs](scripts/Run-ClaudeKillSwitch-Hidden.vbs) | 隐藏启动并传递退出码 |
 
-第一次准备保护规则时，应在隔离网络或已有可靠出口保护的条件下识别程序，避免为获取路径先让未保护程序联网。
+确认后，只解除这四个文件的下载标记：
 
-## 3. Mihomo 配置
+```powershell
+$scriptFiles = @(
+    'KillSwitch.config.psd1',
+    'Update-ClaudeKillSwitch.ps1',
+    'Watch-ClaudeKillSwitch.ps1',
+    'Run-ClaudeKillSwitch-Hidden.vbs'
+)
+foreach ($file in $scriptFiles) {
+    Unblock-File -LiteralPath (Join-Path "$repoDir\scripts" $file)
+}
+```
 
-下面是合并到现有配置中的片段，**不是完整配置**。将 `PROXY_A`、`PROXY_B` 替换为已经存在、允许使用的实际代理节点名称。保留原来的 DNS 配置，避免重复 YAML 顶层键。
+## 第 2 步：配置 Mihomo/Clash
+
+这一步在你的代理客户端中操作，菜单名称因客户端而异：
+
+1. 备份当前配置，记下可用代理节点的准确名称。
+2. 在 TUN 设置中启用 **TUN、Auto Route、Auto Detect Interface、Strict Route**。
+3. 使用客户端支持的持久覆写/合并功能，合并下面的片段。将 `PROXY_A`、`PROXY_B` 换成已有节点名称；只有一个节点就删除 `PROXY_B` 那行。
+4. 将五条新规则放在其他可能提前匹配的规则前面，保留原有后续规则和 DNS 配置。
+5. 保存、检查配置、重新加载。打开最终生效配置，确认组、规则和 TUN 设置确实存在。
 
 ```yaml
 find-process-mode: strict
@@ -107,148 +140,148 @@ rules:
   - DOMAIN-SUFFIX,anthropic.com,Claude-KillSwitch
   - DOMAIN-SUFFIX,claude.ai,Claude-KillSwitch
   - DOMAIN-SUFFIX,claude.com,Claude-KillSwitch
-  # 接在后面的原有规则保持原顺序
+  # 后面保留你的其他规则
 ```
 
-将这些规则放在可能提前匹配的其他规则前面，并在客户端的合并结果中检查。订阅更新可能覆盖直接修改的配置，优先使用客户端支持的持久覆写方式。
+这是片段，不是完整配置。已有 `tun`、`rules` 或 `proxy-groups` 时要合并，不要重复顶层键或覆盖整份订阅。不清楚持久覆写入口时，把客户端名称和版本告诉 Agent，让它检查实际环境。
 
-专用组及其引用的嵌套组不得包含 `DIRECT` 或可能直连的兜底。`empty-fallback: REJECT` 处理的是组为空，不能解读成节点健康检查失败后自动切换到 `REJECT`。旧内核是否支持该字段需通过配置检查确认。[Mihomo 代理组文档](https://wiki.metacubex.one/config/proxy-groups/)
+**继续条件：**加载成功，专用组及其引用链中没有 `DIRECT` 或直连兜底，订阅刷新也不会抹掉这些设置。`empty-fallback: REJECT` 处理组为空，不表示健康检查失败后动态切换为 `REJECT`；旧内核不支持时先解决兼容性。[Mihomo 代理组文档](https://wiki.metacubex.one/config/proxy-groups/)
 
-域名列表不保证穷尽登录、遥测、更新等请求；进程规则也依赖进程识别成功。检查连接面板中的进程、命中规则及完整代理链；其他进程代发请求时要另行分析。共享服务域名不宜不加区分地全部归入 Claude。
+`strict-route` 在 Windows 下有阻止多宿主 DNS 泄漏的措施，但不代表 Mihomo 退出后仍有系统级保护；Windows 的 DNS 劫持也有局域网 DNS 限制。[Mihomo TUN 文档](https://wiki.metacubex.one/config/inbound/tun/)
 
-`strict-route` 在 Windows 下包含防止多宿主 DNS 泄漏的措施，但不能据此推导 Mihomo 崩溃后仍有系统级保护。官方也说明 Windows 的 DNS 劫持存在局域网 DNS 限制。[Mihomo TUN 文档](https://wiki.metacubex.one/config/inbound/tun/)
+## 第 3 步：记录真实网卡名称
 
-## 4. Windows 防火墙规则
-
-本文选择**明确的网卡别名**，而不是直接假定 `Wireless` / `Wired` 等于所有物理网卡、并一定排除 TUN。`Radmin VPN` 只是可能存在的接口示例，不应照抄成每个人都必须有的网卡。
-
-单条规则的含义可以用下面的命令理解。替换路径和接口后才运行；完整程序路径不能使用版本目录通配符。
+保持 TUN 开启，在管理员 PowerShell 执行：
 
 ```powershell
-$programPath = 'C:\实际目录\claude.exe'
-$egressAlias = '实际非TUN网卡名称'
-
-New-NetFirewallRule -Name 'ClaudeKS-Manual-Example' `
-    -DisplayName 'Claude KillSwitch manual example' `
-    -Group 'Claude KillSwitch manual example' `
-    -Direction Outbound -Action Block -Enabled True -Profile Any `
-    -Program $programPath -InterfaceAlias $egressAlias -Protocol Any
+Get-NetAdapter -IncludeHidden |
+    Format-Table Name, InterfaceDescription, Status, ifIndex
+Get-NetIPInterface |
+    Format-Table InterfaceAlias, AddressFamily, InterfaceMetric, ConnectionState
+Get-NetRoute -AddressFamily IPv4 |
+    Format-Table DestinationPrefix, InterfaceAlias, NextHop, RouteMetric
+Get-NetRoute -AddressFamily IPv6 |
+    Format-Table DestinationPrefix, InterfaceAlias, NextHop, RouteMetric
 ```
 
-为每个目标程序路径和每个可能直连的接口建立规则；不要把 TUN 本身放进阻止列表。规则不限定地址族和协议，意图覆盖该接口上的 IPv4、IPv6、TCP、UDP，而不是仅拦 443/TCP。[Microsoft：New-NetFirewallRule](https://learn.microsoft.com/en-us/powershell/module/netsecurity/new-netfirewallrule)
+记录 `Name` / `InterfaceAlias`，不要填写网卡描述：
 
-不要创建“阻止 Claude 所有接口”后，再用“允许 TUN”尝试抵消它：普通显式阻止规则优先于冲突的允许规则。[Microsoft：防火墙规则优先级](https://learn.microsoft.com/en-us/windows/security/operating-system-security/network-security/windows-firewall/rules)
-
-下面的自动脚本管理独立规则组 `Claude Auto KillSwitch v2`。手工示例、原有旧版规则不在其管理范围内。
-
-## 5. 自动刷新脚本
-
-仓库中的文件：
-
-| 文件 | 用途 |
+| 接口 | 是否加入后面的阻止列表 |
 | --- | --- |
-| [KillSwitch.config.psd1](scripts/KillSwitch.config.psd1) | 非 TUN 网卡别名与额外完整程序路径 |
-| [Update-ClaudeKillSwitch.ps1](scripts/Update-ClaudeKillSwitch.ps1) | 查找路径并创建或更新规则 |
-| [Watch-ClaudeKillSwitch.ps1](scripts/Watch-ClaudeKillSwitch.ps1) | 登录后刷新一次，再监听进程启动 |
-| [Run-ClaudeKillSwitch-Hidden.vbs](scripts/Run-ClaudeKillSwitch-Hidden.vbs) | 隐藏启动并等待监听器退出 |
+| 当前 Mihomo 使用的 TUN | 不加入 |
+| 其他可能直连的接口 | 加入，包括暂时断开的 Wi-Fi、以太网，以及可能提供出口的 USB 共享和其他 VPN |
 
-在管理员 PowerShell 中，将仓库中的四个文件复制到受保护目录。下面假设当前目录是仓库根目录：
+`WLAN`、`Ethernet`、`Radmin VPN` 都只是示例，不要照抄。不能只看默认路由，拆分默认路由和更具体的路由也能成为出口；不能假设虚拟接口都安全或 `Wired` 一定排除 TUN。
+
+**继续条件：**你能确认 TUN 身份和所有要阻止的接口。不确定时，让 Agent 分析输出后再继续。
+
+## 第 4 步：确认 Claude 的完整程序路径
+
+保存并结束 Claude 工作。为避免未保护程序在识别时联网，**先暂时断开 Wi-Fi、拔掉网线并断开其他外网出口**，再启动要保护的 Desktop / Code，保留安装终端。本地 Agent 也可能依赖网络，应事先与它约定这一步。
+
+断网后运行：
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name = 'claude.exe'" |
+    Select-Object ProcessId, Name, ExecutablePath
+Get-Command claude -ErrorAction SilentlyContinue |
+    Format-List Source, Path, CommandType
+Get-AppxPackage | Where-Object { $_.Name -like '*Claude*' } |
+    Select-Object Name, Version, InstallLocation
+```
+
+当前脚本主要自动识别以下路径类型：
+
+```text
+Desktop：
+C:\Program Files\WindowsApps\Claude_<版本>_<架构>__<包标识>\app\Claude.exe
+
+当前用户由 Desktop 启动的 Code：
+C:\Users\<用户>\AppData\Roaming\Claude\claude-code\<版本>\claude.exe
+```
+
+独立 CLI 或其他位置需要把**实际联网进程的完整 `.exe` 路径**记下来，下一步填入 `ExtraProgramPaths`。`.cmd`、`.ps1`、符号链接可能只是启动器；不要直接封锁共享 `node.exe`。
+
+**继续条件：**每个要保护的组件都有已确认路径。找不到命令不代表没安装；路径为空时检查权限或进程是否已退出。若断网后无法启动 Code、无法确认路径，先停在这里，不要为了找路径直接恢复未受保护的联网。
+
+## 第 5 步：安装文件并填写配置
+
+以下是**首次安装**流程，在同一个管理员窗口中执行：
 
 ```powershell
 $installDir = Join-Path $env:ProgramFiles 'ClaudeKillSwitch'
-New-Item -ItemType Directory -Path $installDir -Force | Out-Null
-$files = @(
-    'KillSwitch.config.psd1',
-    'Update-ClaudeKillSwitch.ps1',
-    'Watch-ClaudeKillSwitch.ps1',
-    'Run-ClaudeKillSwitch-Hidden.vbs'
-)
-foreach ($file in $files) {
-    Copy-Item -LiteralPath (Join-Path '.\scripts' $file) -Destination $installDir
+if (Test-Path -LiteralPath $installDir) {
+    throw '安装目录已存在，请先按 README 的已有安装更新流程处理。'
+}
+$oldTask = Get-ScheduledTask | Where-Object { $_.TaskName -eq 'Refresh Claude Kill Switch' }
+if ($oldTask) { throw '已有同名任务，请检查旧安装，不能直接覆盖。' }
+New-Item -ItemType Directory -Path $installDir | Out-Null
+foreach ($file in $scriptFiles) {
+    Copy-Item -LiteralPath (Join-Path "$repoDir\scripts" $file) -Destination $installDir
 }
 Get-Acl -LiteralPath $installDir | Format-List
-notepad (Join-Path $installDir 'KillSwitch.config.psd1')
 ```
 
-这是首次安装步骤。更新已有安装前先停止任务、确认监听器已退出，并备份本地配置；不要用仓库的占位配置覆盖已核对的网卡列表。目录和其中的脚本、配置均不能允许普通用户随意写入，因为任务将以提升权限运行。不要把提升权限的任务直接指向普通用户可写的下载目录或 Git 工作目录。
+目录通常为 `C:\Program Files\ClaudeKillSwitch`。确认目录和四个文件未授予普通用户写入或修改权限。不要让提升权限的任务直接执行下载目录、Git 工作目录等普通用户可写位置的脚本。
 
-配置示例如下，必须替换成自己的环境。不存在 Radmin VPN 就不填；其他直连接口不能遗漏。
+**先编辑下面代码，再执行：**
+
+- 将 `你的非TUN网卡名称` 换成第 3 步确认的名字。多个接口例如 `@('Wi-Fi', 'Ethernet')`，不包含 TUN。
+- 自动识别覆盖全部程序时保留 `ExtraProgramPaths = @()`；否则填入准确完整路径，例如 `@('C:\实际目录\claude.exe')`。
+- 版本目录不能用 `*`；路径中的单引号需要写成两个单引号。
 
 ```powershell
+$configText = @'
 @{
-    BlockedInterfaceAliases = @('WLAN', 'Ethernet', 'Radmin VPN')
-    ExtraProgramPaths = @(
-        # 'C:\已确认的独立Claude安装目录\claude.exe'
-    )
+    BlockedInterfaceAliases = @('你的非TUN网卡名称')
+    ExtraProgramPaths = @()
+}
+'@
+$configPath = Join-Path $installDir 'KillSwitch.config.psd1'
+Set-Content -LiteralPath $configPath -Value $configText -Encoding UTF8
+Get-Content -LiteralPath $configPath
+```
+
+**继续条件：**输出没有占位文字，接口和路径与前两步一致。配置写在安装目录，而非只改了下载的样例。这里的 Windows PowerShell 5.1 UTF-8 写入会带 BOM，以避免中文名称被错误解码。
+
+## 第 6 步：第一次建立并核对规则
+
+保持隔离状态和目标进程，执行一次刷新。执行策略只作用于这个 PowerShell 子进程，不修改整台电脑的策略：
+
+```powershell
+& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+    -NoProfile -ExecutionPolicy Bypass `
+    -File "$installDir\Update-ClaudeKillSwitch.ps1"
+if ($LASTEXITCODE -ne 0) { throw '规则刷新失败，请处理错误后再继续。' }
+
+$rules = @(Get-NetFirewallRule -PolicyStore ActiveStore |
+    Where-Object { $_.Group -eq 'Claude Auto KillSwitch v2' })
+if ($rules.Count -eq 0) { throw '有效策略中没有本项目规则，不能继续。' }
+$rules | Format-Table Name, Enabled, Direction, Action, Profile
+foreach ($rule in $rules) {
+    [pscustomobject]@{
+        Name = $rule.Name
+        Program = ($rule | Get-NetFirewallApplicationFilter).Program
+        Interfaces = (($rule | Get-NetFirewallInterfaceFilter).InterfaceAlias -join ', ')
+    } | Format-List
 }
 ```
 
-在管理员终端先运行一次，确认没有错误：
+**继续条件：**刷新无错误，每个目标路径与每个要阻止的接口都有对应规则，显示 `Enabled=True`、`Outbound`、`Block`、`Profile=Any`。TUN 不应出现在阻止接口条件中。
 
-```powershell
-& "$env:ProgramFiles\ClaudeKillSwitch\Update-ClaudeKillSwitch.ps1"
-```
+例如首次安装有 2 个不同程序路径、3 个阻止接口，应有 6 条对应规则；后续旧版本规则会累积，不能只数条数。
 
-刷新逻辑：
+看到 `No matching executable found` 或 `Refreshed 0 executable path(s)` 表示没有找到目标，不代表成功。核对当前账户、进程和额外路径。受管设备可能不采用本地规则，因此这里检查 `ActiveStore`。
 
-1. 从运行中的 `claude.exe` 收集已知 Desktop / 当前用户 Desktop 内置 Code 路径，并对全部不同路径处理，不只取第一个进程。
-2. 对名为 `Claude` 的当前用户 Appx 包尝试预先读取 `app\Claude.exe`；如果包名不同，需调整识别或明确填写额外路径。
-3. 合并 `ExtraProgramPaths`，按“完整路径 + 接口别名”生成固定规则名，重复运行不会不断新增同一规则。
-4. 为新路径添加规则，保留旧路径规则。找不到程序不会删除已有规则；执行错误会上报，不全局静默忽略。
+## 第 7 步：设置隐藏监听和登录自启
 
-已识别运行进程的路径不要求再次通过 `Test-Path`。人工填写的额外路径必须自行确认正确，它并不因为写进防火墙就证明是实际联网程序。
-
-规则列表会随版本变化累积。这是保留旧进程保护的选择。清理旧规则前必须确认旧版本不会继续运行，也不会回滚使用。修改配置去掉某网卡不会自动删除已有规则；重命名或新增网卡后要重新核对并手动刷新。
-
-## 6. 事件监听器与隐藏启动
-
-监听器先订阅 `Win32_ProcessStartTrace`，再进行首次扫描，以减少注册事件期间漏掉启动的机会。之后 `Wait-Event` 等待 Claude 启动，触发一次刷新；没有每分钟启动新 PowerShell 的计划触发器。
-
-监听器不使用原示例的 `$Pid` 变量。PowerShell 变量名不区分大小写，`$PID` 是当前 PowerShell 进程的自动变量，不能拿来保存目标进程 ID。本文直接重新扫描所有符合条件的进程。[Microsoft：自动变量](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_automatic_variables)
-
-也不使用“5 秒内丢弃所有事件”的全局节流，避免 Desktop 启动后紧接着启动 Code 时遗漏后者。Electron 子进程多时会重复刷新，这是当前简化实现的成本。互斥锁防止同一会话内重复监听。
-
-VBS 的核心是：
-
-```vbscript
-result = shell.Run(command, 0, True)
-WScript.Quit result
-```
-
-窗口样式 `0` 用于隐藏启动，`True` 让 VBS 等待 PowerShell，随后把退出码交回计划任务。原来的 `False` 会让启动器立即退出，因此任务显示成功并不能说明监听器还活着。完整代码见 [VBS 文件](scripts/Run-ClaudeKillSwitch-Hidden.vbs)。
-
-错误记录在安装目录的 `watcher.log`。刷新失败时监听器退出为非零状态，供计划任务重试；已经存在的规则仍保留。日志不是持续心跳，安静期间没有新记录不代表监听器死亡。
-
-## 7. 登录计划任务
-
-仍在目标用户的管理员 Windows PowerShell 中执行。目标用户需具备管理员权限；不要使用另一管理员账户代替目标用户，否则 Appx、AppData 和登录触发用户可能不一致。
-
-先检查旧任务和旧监听器：
-
-```powershell
-$taskName = 'Refresh Claude Kill Switch'
-Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" |
-    Where-Object { $_.CommandLine -like '*Watch-ClaudeKillSwitch.ps1*' } |
-    Select-Object ProcessId, ExecutablePath, CommandLine
-```
-
-如果原来已有同名任务，先停止它：
-
-```powershell
-Stop-ScheduledTask -TaskName 'Refresh Claude Kill Switch'
-```
-
-旧 VBS 使用异步启动时，停止任务可能留下子进程。根据上面的完整命令行确认属于这个监听器后，单独用 `Stop-Process -Id <已确认的进程号>` 停止它。不要按名称结束所有 PowerShell。
-
-确认后，注册任务；`-Force` 会替换同名任务，包括旧的周期触发器：
+确认第 6 步通过后，执行：
 
 ```powershell
 $taskName = 'Refresh Claude Kill Switch'
 $installDir = Join-Path $env:ProgramFiles 'ClaudeKillSwitch'
 $vbsPath = Join-Path $installDir 'Run-ClaudeKillSwitch-Hidden.vbs'
 $userId = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-
 $action = New-ScheduledTaskAction `
     -Execute "$env:SystemRoot\System32\wscript.exe" `
     -Argument ('//B //NoLogo "{0}"' -f $vbsPath) `
@@ -262,38 +295,16 @@ $settings = New-ScheduledTaskSettingsSet `
     -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -StartWhenAvailable
-
 Register-ScheduledTask -TaskName $taskName -Action $action `
-    -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+    -Trigger $trigger -Principal $principal -Settings $settings | Out-Null
 Start-ScheduledTask -TaskName $taskName
 ```
 
-`ExecutionTimeLimit` 设为零用于常驻监听；失败重试 3 次，间隔 1 分钟，这不是每分钟刷新规则。它不能保证任何故障都自动恢复，达到重试上限后需要处理日志中的错误并手动启动。[Microsoft：计划任务设置](https://learn.microsoft.com/en-us/powershell/module/scheduledtasks/new-scheduledtasksettingsset)
+首次安装故意不加 `-Force`，避免覆盖未知同名任务。任务在当前用户登录时启动，立即刷新一次，之后等待进程启动事件。没有每分钟刷新触发器；1 分钟是失败重试间隔，最多 3 次。零运行时限允许常驻。[Microsoft：计划任务设置](https://learn.microsoft.com/en-us/powershell/module/scheduledtasks/new-scheduledtasksettingsset)
 
-VBS/Windows Script Host 在某些 Windows 版本或组织策略中可能不可用。此时不要依赖隐藏启动，也不要为此绕过组织策略；可由管理员改为合适的非交互任务或服务方式，并重新验证身份、权限及退出码传播。[Microsoft：wscript](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/wscript)
+## 第 8 步：检查后台是否真的运行
 
-## 8. 验证命令与故障测试
-
-### 8.1 检查有效策略，而不只检查本地保存的规则
-
-```powershell
-Get-Service MpsSvc, BFE | Format-Table Name, Status
-Get-NetFirewallProfile -PolicyStore ActiveStore |
-    Format-Table Name, Enabled, DefaultOutboundAction, AllowLocalFirewallRules
-
-$rules = @(Get-NetFirewallRule -PolicyStore ActiveStore |
-    Where-Object { $_.Group -eq 'Claude Auto KillSwitch v2' })
-$rules | Format-Table Name, Enabled, Direction, Action, Profile
-$rules | Get-NetFirewallApplicationFilter | Format-Table InstanceID, Program
-$rules | Get-NetFirewallInterfaceFilter | Format-Table InstanceID, InterfaceAlias
-$rules | Get-NetFirewallInterfaceTypeFilter | Format-Table InstanceID, InterfaceType
-$rules | Get-NetFirewallAddressFilter | Format-Table LocalAddress, RemoteAddress
-$rules | Get-NetFirewallPortFilter | Format-Table Protocol, LocalPort, RemotePort
-```
-
-核对每个实际程序路径和每个目标接口都有启用的出站阻止规则。受管设备的策略可能限制本地规则合并；规则写入成功不等于有效策略采用了它。
-
-### 8.2 检查监听器
+等几秒后执行：
 
 ```powershell
 Get-ScheduledTask -TaskName 'Refresh Claude Kill Switch' |
@@ -306,54 +317,102 @@ Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" |
 Get-Content "$env:ProgramFiles\ClaudeKillSwitch\watcher.log" -Tail 30
 ```
 
-常驻任务预期处于 `Running`，`LastTaskResult` 可能是运行中状态码，而不是 `0`。单独的 `0` 不能证明监听器持续工作，更不能证明没有直连。
+**预期结果：**任务为 `Running`，当前会话只有一个属于本安装的监听器，命令行指向安装目录；日志含 `watcher started; initial refresh completed` 且没有后续 `ERROR`。
 
-### 8.3 验证真实网络行为
+常驻任务的 `LastTaskResult` 可以是运行中状态码，不要求为 `0`。只有任务存在或返回 `0` 都不足以证明监听器正常。
 
-初次故障测试应在隔离环境或有额外出口控制的环境中进行，避免测试本身造成未知出口访问。保存工作后逐项测试：
+若任务迅速结束、没有日志，检查动作路径和任务历史。某些 Windows 环境或组织策略不允许 VBScript / Windows Script Host，不要绕过策略；需要管理员改用适当的非交互任务或服务方案，并重新验证账户、权限和退出码传播。[Microsoft：wscript](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/wscript)
+
+## 第 9 步：恢复网络并验证
+
+### 先验证正常使用
+
+1. 确认每个目标路径都已受到第 6 步的有效规则保护，监听器运行正常。
+2. 关闭用于识别路径的 Claude，恢复网络，先确认 Mihomo 的 TUN 和专用组正常。
+3. 重新启动 Claude，发起新请求。在 Mihomo 连接面板核对实际进程、命中规则及完整代理链，不能出现 `DIRECT`。
+4. 检查日志中的 `process event; refresh completed`，重新执行第 6 步的查询部分，确认当前程序路径仍被覆盖。
+
+请求失败时检查是否误阻止 TUN、路径是否错误、代理是否可用，以及旧的宽泛阻止规则。不要以关闭整个防火墙代替排错。
+
+### 再验证断线行为
+
+**只在隔离测试环境或已有额外出口控制时进行故障测试。** 保存工作，逐项测试，结束后恢复原配置。没有条件时记录为“安装及静态检查完成，断线行为未实测”，不要宣称零泄漏。
 
 | 场景 | 应观察到的结果 |
 | --- | --- |
-| 代理和 TUN 正常 | 新建请求成功；Mihomo 连接记录显示专用代理链，没有 `DIRECT` |
-| 所有选定代理节点不可达 | 新建请求失败；没有物理接口上的 Claude 直连 |
-| 停止 Mihomo / 关闭 TUN | 新建请求失败；物理接口抓包和防火墙事件支持阻断结论 |
-| 恢复代理 | 新建请求恢复，不需要临时关闭防火墙 |
-| 重启、重新登录 | 任务启动、监听器存在、规则与程序路径对应 |
-| 升级 Claude 或新增接口 | 重新核对新路径、新接口及 IPv4/IPv6；不能沿用旧结论 |
+| 所有选定节点不可达，Mihomo 仍运行 | 新请求失败，没有直连回退 |
+| 关闭 TUN 或停止 Mihomo | 新请求失败，物理接口抓包/防火墙事件支持阻断结论 |
+| 恢复 Mihomo 和代理 | 新请求恢复，不需要关闭防火墙 |
+| 保存工作后重新登录 Windows | 任务和唯一监听器启动，规则匹配当前路径 |
+| Claude 升级或接口变化 | 重新核对路径、接口及 IPv4/IPv6，不能沿用旧结论 |
 
-同时测试 TCP、UDP/QUIC（若应用使用）和 IPv6。检查已有长连接以及重新建立的连接。仅仅看到客户端转圈、缓存内容或连接错误，不足以证明零流量泄漏。
+需覆盖 IPv4、IPv6、TCP、UDP/QUIC（若使用），并观察已有连接与新连接。客户端报错不等于零流量。结合物理接口抓包、防火墙丢弃日志/过滤平台审计及 Mihomo 日志分析，勿公开敏感原始日志。
 
-观察连接归属的辅助命令：
+## 日常维护与已有安装更新
 
-```powershell
-$claudeProcessIds = @(Get-CimInstance Win32_Process -Filter "Name = 'claude.exe'" |
-    Select-Object -ExpandProperty ProcessId)
-Get-NetTCPConnection | Where-Object { $_.OwningProcess -in $claudeProcessIds } |
-    Format-Table OwningProcess, LocalAddress, RemoteAddress, RemotePort, State
-Get-NetUDPEndpoint | Where-Object { $_.OwningProcess -in $claudeProcessIds } |
-    Format-Table OwningProcess, LocalAddress, LocalPort
+新版本启动后，监听器尝试补建规则，保留旧路径保护。新增或重命名网卡后需要你修改配置并手动刷新，网卡变化本身不会触发监听器。
+
+已有安装按以下顺序更新：
+
+1. 在受保护的本地目录备份安装的四个文件、日志和任务定义；使用 `Export-ScheduledTask -TaskName 'Refresh Claude Kill Switch'` 导出任务 XML，并记录本项目规则的应用和接口条件。备份可能含个人路径，不要上传。
+2. 核对任务动作和监听器完整命令行，确认属于本项目，再停止任务。旧 VBS 异步启动可能留下子进程，只结束已经核实的监听器 PID。
+3. 替换受保护目录中的三个程序脚本，**保留并审阅原 `KillSwitch.config.psd1`**，不能用仓库的占位配置覆盖它。
+4. 手动刷新并核对有效规则。若需要更新同名任务，完成备份和身份核对后，才在第 7 步的 `Register-ScheduledTask` 上加 `-Force`。
+5. 重新执行第 8～9 步适用的检查。除非确认旧进程和回滚版本均不会使用，否则保留旧路径规则。
+
+删除配置中的接口不会自动删除旧规则。原有 `Claude Code Current`、旧 `Claude Auto KillSwitch` 等规则也不由本版本自动清理，需单独核对。
+
+## 常见问题
+
+| 现象 | 处理方式 |
+| --- | --- |
+| 未配置网卡 | 修改安装目录中的配置，去掉占位符 |
+| 禁止运行脚本 | 使用第 6 步的单进程执行策略；组织强制策略交由管理员处理 |
+| 刷新 0 个程序 | 核对实际联网进程、账户和额外路径，不能直接继续 |
+| 正常代理下 Claude 不通 | 检查是否误阻止 TUN、代理链、路径和旧规则 |
+| 任务结束且没有日志 | 检查 wscript 路径、脚本可用性和任务历史 |
+| 日志出现 ERROR | 处理具体错误后，再执行 `Start-ScheduledTask -TaskName 'Refresh Claude Kill Switch'` |
+| 多个监听器 | 检查旧任务和完整命令行，仅停止已确认的重复实例 |
+| 日志不增长 | 日志不是心跳，没有启动事件时不会新增记录 |
+| 插入新网卡后保护不确定 | 更新接口列表，手动刷新并重新验证 |
+
+## 原理与脚本行为
+
+```text
+正常：Claude.exe → TUN → Mihomo → 代理节点 → 目标服务
+TUN 失效：已知 Claude.exe → 已列出的非 TUN 接口 → Windows 防火墙阻止
 ```
 
-这些瞬时列表会漏掉短连接，也不能直接证明物理出口。需要结合物理接口抓包、Windows 防火墙丢弃日志/过滤平台审计和 Mihomo 日志分析；抓包和日志可能包含敏感数据，不应直接公开上传。
+这是设计意图，实际是否按预期匹配取决于 Windows 过滤、TUN 实现和本机策略，必须验证正常使用与故障两个方向。
 
-## 9. 已知限制与安全注意事项
+规则按“完整程序路径 + 明确接口别名 + 出站 + 阻止”匹配，覆盖所有防火墙配置文件，未限定协议或地址族。`-Program` 不支持用版本通配符代替完整路径，所以脚本需要识别新路径。[Microsoft：New-NetFirewallRule](https://learn.microsoft.com/en-us/powershell/module/netsecurity/new-netfirewallrule)
 
-- 新路径出现到规则创建完成之间有竞态。事件监听和预扫描只能缩小部分窗口，无法使首次运行严格 fail-closed。短命进程可能在扫描前退出，无法补建规则。
-- Windows 登录时程序可能比监听器更早启动；旧路径已存在的持久规则仍可起作用，新路径没有这种保证。
-- 别名列表不是“除 TUN 外的所有网卡”。新增、重命名、USB 共享、其他 VPN 和路由变化都需要复核；仅发生网卡变化不会触发本监听器。
-- 本例识别的路径是有范围的经验规则，不是身份验证或完整安装清单。新安装形式需要更新识别或明确填写完整路径。
-- WSL、容器、浏览器登录、更新器、MCP 工具、子进程、共享 Node 运行时或本地代理代发请求均不能自动视为已保护。
-- 程序规则不能保证由系统 DNS 服务或其他进程代发的 DNS 全部受控；DoH、局域网 DNS、IPv6 与 DNS 启动解析需独立验证。
-- 本地代理即使只监听回环地址，也可能代表应用直连。应用侧规则不能代替对代理路由策略的检查。
-- 监听器采用当前用户、当前会话的互斥锁；本文面向单用户会话。多用户、多会话、服务账户部署需要单独设计规则管理和锁范围。
-- 防火墙关闭、组织策略覆盖、管理员修改规则或驱动行为变化均可能改变结果。日志可帮助发现故障，但不构成防篡改审计。
-- `ExecutionPolicy Bypass` 只用于这次经过审阅的启动，不应被理解为安全校验。对脚本签名、组织执行策略有要求时应按环境调整。
-- 持久规则和运行日志会保留本机路径，管理员应定期检查；日志没有自动轮转。分享时去除用户名、IP、代理订阅、令牌和命令行中的秘密。
-- 网络断线保护不能保证账号不会被限制，也不改变服务的使用条件。公开技术笔记不能用来判断服务商的账号处置方式；本文不对国籍、所在地或封号概率作推断。
+脚本以路径和接口的哈希生成规则名，重复刷新不会持续增加相同规则；处理所有匹配版本，不先删旧规则。已运行进程提供的路径不要求再次通过文件存在检查；Appx 预扫描仅针对当前用户名为 `Claude` 的包，其他安装需确认并补充路径。
 
-## 10. 停用与回滚
+监听器先订阅 `Win32_ProcessStartTrace` 再扫描，然后用 `Wait-Event` 等待启动。没有“5 秒内丢弃所有事件”的节流，避免遗漏紧接着启动的 Code；代价是 Electron 子进程触发重复刷新。它不复用 PowerShell 自动变量 `$PID`。[Microsoft：自动变量](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_automatic_variables)
 
-先停止任务，再检查监听器是否确实退出。停用监听器只停止未来刷新，旧防火墙规则仍保留。
+VBS 用 `shell.Run(command, 0, True)` 隐藏启动、等待 PowerShell，再传递退出码。若用不等待的 `False`，任务会提前结束。刷新失败会记日志、以非零状态退出，计划任务有限重试；旧规则保留。
+
+不要创建“阻止所有接口”再试图用“允许 TUN”抵消：普通显式阻止规则优先于冲突的允许规则。[Microsoft：规则优先级](https://learn.microsoft.com/en-us/windows/security/operating-system-security/network-security/windows-firewall/rules)
+
+## 已知限制与安全注意事项
+
+- 首次运行、新版本和登录时的新路径可能先发请求再补规则。短命进程可能在扫描前退出，事件监听不能消除竞态。
+- 未列出的出口不受保护，别名列表不自动追踪新增网卡或路由变化。
+- Mihomo 自己执行的 `DIRECT` 不会被针对 Claude 的规则阻止，因此代理配置是必要的一层。
+- 浏览器登录、更新器、MCP 工具、子进程、共享 Node、WSL、容器和其他本地代理不自动受保护。
+- 系统 DNS 服务代发请求、DoH、局域网 DNS 和 IPv6 需独立验证，程序规则不能证明全部受控。
+- 当前设计面向单用户会话，互斥锁只覆盖当前会话；多用户、服务账户和多会话需另行设计。
+- 防火墙关闭、组织策略覆盖、管理员修改规则或驱动变化均可能改变结果。
+- `ExecutionPolicy Bypass` 不是安全校验；有签名或组织执行策略要求时按环境调整。
+- 日志没有自动轮转；路径和日志可能包含个人信息。不要公开订阅、令牌、真实 IP 或未清理的诊断输出。
+- 断线保护不能保证账号不会被限制，也不改变服务使用条件；本文不据此推断国籍、所在地或账号处置结果。
+
+覆盖未知路径和所有启动时机，需要额外设计系统级默认拒绝出口、隔离环境或网关策略。本文没有部署这种系统级保护。
+
+## 停用和卸载
+
+先停止自动刷新，保留当前防火墙规则：
 
 ```powershell
 Disable-ScheduledTask -TaskName 'Refresh Claude Kill Switch'
@@ -363,7 +422,7 @@ Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" |
     Select-Object ProcessId, CommandLine
 ```
 
-如有残留，只结束已核实的监听器 PID。确认退出后，先预览本版本的规则：
+如有残留，用 `Stop-Process -Id` 加上已核实的监听器进程号结束它，不要停止所有 PowerShell。确认退出后，预览仅属于本版本的规则：
 
 ```powershell
 $ownedRules = @(Get-NetFirewallRule -PolicyStore PersistentStore |
@@ -372,22 +431,17 @@ $ownedRules | Format-Table Name, DisplayName
 $ownedRules | Remove-NetFirewallRule -WhatIf
 ```
 
-**下面的删除会撤销本文的应用出站保护。** 仅在已经准备好替代保护或确认需要卸载时执行：
+**以下操作将撤销这些程序的本项目出站保护。** 仅在已有替代保护或明确要卸载时执行：
 
 ```powershell
 $ownedRules | Remove-NetFirewallRule
 Unregister-ScheduledTask -TaskName 'Refresh Claude Kill Switch' -Confirm
 ```
 
-原对话中的 `Claude Code Current`、旧 `Claude Auto KillSwitch` 规则和手工示例不会被这个规则组清理命令删除。请逐条检查，避免误删其他规则或因遗留规则误判新版配置。
+确认任务和监听器不再存在后，可手动删除安装目录。其他旧版规则需逐条核对，不要重置整个防火墙。卸载不会还原第 2 步的 Mihomo 覆写，需要时用当时的配置备份恢复。
 
-## 11. 相比最初脚本的修正
+## 验证范围
 
-- 不复用 `$PID`，不全局吞掉异常。
-- 新旧路径各自保留规则，不以删除旧规则作为刷新前提。
-- 处理所有匹配路径，避免只保护第一个进程版本。
-- 明确配置网卡别名，不保证 `Wired` 一定排除虚拟接口。
-- 订阅事件后再扫描，不用全局 5 秒丢事件节流。
-- VBS 等待子进程并传播退出码，任务允许常驻并有限重试。
-- 把脚本放在受保护目录，不把提高权限的常驻任务绑定到普通用户可写脚本。
-- 将“规则存在”“有效策略采用”“故障时阻断”区分验证，不声称零窗口或绝对防泄漏。
+仓库脚本经过 PowerShell 语法和模拟行为检查，覆盖重复刷新、多版本路径、空扫描保留规则和创建失败时报错。README 的 PowerShell 代码块也经过语法检查。
+
+这些检查不等于真实防火墙、VBScript、计划任务、Mihomo TUN 和故障断网的端到端验证。请按本机环境完成第 6～9 步，并记录尚未验证的部分。
